@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { Search, Filter, X, AlertCircle, Database, RefreshCw } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Search, Filter, X, AlertCircle, Database, RefreshCw, MessageCircle, Send, Minimize2 } from 'lucide-react';
 
-export default function ClientDatabase() {
+function ClientDatabase() {
   const [clients, setClients] = useState([]);
   const [filteredClients, setFilteredClients] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -21,6 +21,25 @@ export default function ClientDatabase() {
   const [filters, setFilters] = useState({});
   const [availableFilters, setAvailableFilters] = useState([]);
   const [showFilters, setShowFilters] = useState(false);
+
+  // Chat states
+  const [showChat, setShowChat] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatEndRef = useRef(null);
+  
+  // Get OpenAI API key from environment variable
+  const openaiKey = process.env.REACT_APP_OPENAI_API_KEY || '';
+
+  // Scroll to bottom of chat
+  const scrollToBottom = () => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [chatMessages]);
 
   // Fetch clients from Airtable
   const fetchClients = async () => {
@@ -50,7 +69,6 @@ export default function ClientDatabase() {
       setClients(data.records);
       setFilteredClients(data.records);
       
-      // Extract available filter fields
       if (data.records.length > 0) {
         const fields = Object.keys(data.records[0].fields);
         setAvailableFilters(fields);
@@ -64,11 +82,83 @@ export default function ClientDatabase() {
     }
   };
 
+  // Send message to OpenAI
+  const sendChatMessage = async () => {
+    if (!chatInput.trim()) return;
+
+    if (!openaiKey) {
+      setChatMessages(prev => [...prev, {
+        role: 'assistant',
+        content: 'Error: OpenAI API key is not configured. Please add REACT_APP_OPENAI_API_KEY to your .env file and restart the server.'
+      }]);
+      return;
+    }
+
+    const userMessage = chatInput.trim();
+    setChatInput('');
+    
+    // Add user message
+    const newMessages = [...chatMessages, { role: 'user', content: userMessage }];
+    setChatMessages(newMessages);
+    setChatLoading(true);
+
+    try {
+      // Prepare context about the Airtable data
+      const dataContext = {
+        totalClients: clients.length,
+        availableFields: availableFilters,
+        sampleData: clients.slice(0, 5).map(c => c.fields)
+      };
+
+      const systemMessage = {
+        role: 'system',
+        content: `You are a helpful assistant that answers questions about a client database. The database contains ${dataContext.totalClients} clients with the following fields: ${dataContext.availableFields.join(', ')}. Here's a sample of the data: ${JSON.stringify(dataContext.sampleData, null, 2)}. Provide clear, concise answers about the data. If asked to perform calculations or analysis, do so based on the information provided.`
+      };
+
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [systemMessage, ...newMessages],
+          max_tokens: 1000,
+          temperature: 0.7
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error?.message || 'Failed to get response from OpenAI');
+      }
+
+      const data = await response.json();
+      const assistantMessage = data.choices[0].message.content;
+
+      setChatMessages([...newMessages, { role: 'assistant', content: assistantMessage }]);
+    } catch (err) {
+      setChatMessages([...newMessages, { 
+        role: 'assistant', 
+        content: `Error: ${err.message}. Please check your OpenAI API key and try again.` 
+      }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  };
+
   // Apply search and filters
   useEffect(() => {
     let results = [...clients];
 
-    // Apply search
     if (searchTerm) {
       results = results.filter(client => {
         return Object.values(client.fields).some(value => 
@@ -77,7 +167,6 @@ export default function ClientDatabase() {
       });
     }
 
-    // Apply filters
     Object.entries(filters).forEach(([field, value]) => {
       if (value) {
         results = results.filter(client => {
@@ -101,6 +190,105 @@ export default function ClientDatabase() {
     setFilters({});
     setSearchTerm('');
   };
+
+  // Render chat UI components
+  const renderChatButton = () => (
+    <button
+      onClick={() => setShowChat(true)}
+      className="fixed bottom-6 right-6 bg-indigo-600 text-white p-4 rounded-full shadow-2xl hover:bg-indigo-700 transition-all hover:scale-110 z-50"
+      aria-label="Open chat"
+    >
+      <MessageCircle className="w-6 h-6" />
+    </button>
+  );
+
+  const renderChatWindow = () => (
+    <div className="fixed bottom-6 right-6 w-96 h-[600px] bg-white rounded-2xl shadow-2xl flex flex-col z-50 border border-gray-200">
+      {/* Chat Header */}
+      <div className="bg-indigo-600 text-white p-4 rounded-t-2xl flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <MessageCircle className="w-5 h-5" />
+          <h3 className="font-semibold">AI Assistant</h3>
+          {openaiKey && (
+            <span className="text-xs bg-indigo-700 px-2 py-1 rounded">API Key Loaded</span>
+          )}
+        </div>
+        <button
+          onClick={() => setShowChat(false)}
+          className="text-white hover:text-indigo-200"
+          aria-label="Minimize chat"
+        >
+          <Minimize2 className="w-5 h-5" />
+        </button>
+      </div>
+
+      {/* Chat Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
+        {chatMessages.length === 0 && (
+          <div className="text-center text-gray-500 mt-8">
+            <MessageCircle className="w-12 h-12 mx-auto mb-2 text-gray-300" />
+            <p className="text-sm font-medium">Ask me anything about your clients!</p>
+            <p className="text-xs mt-2 text-gray-400">
+              Examples: "How many clients do we have?" or "What fields are available?"
+            </p>
+          </div>
+        )}
+        
+        {chatMessages.map((msg, idx) => (
+          <div
+            key={idx}
+            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className={`max-w-[80%] p-3 rounded-lg ${
+                msg.role === 'user'
+                  ? 'bg-indigo-600 text-white rounded-br-none'
+                  : 'bg-white text-gray-800 border border-gray-200 rounded-bl-none'
+              }`}
+            >
+              <p className="text-sm whitespace-pre-wrap">{msg.content}</p>
+            </div>
+          </div>
+        ))}
+        
+        {chatLoading && (
+          <div className="flex justify-start">
+            <div className="bg-white border border-gray-200 p-3 rounded-lg rounded-bl-none">
+              <div className="flex gap-1">
+                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></div>
+                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></div>
+              </div>
+            </div>
+          </div>
+        )}
+        <div ref={chatEndRef} />
+      </div>
+
+      {/* Chat Input */}
+      <div className="p-4 border-t bg-white rounded-b-2xl">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyPress={handleKeyPress}
+            placeholder="Ask about your clients..."
+            className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:border-indigo-500 focus:outline-none text-sm"
+            disabled={chatLoading}
+          />
+          <button
+            onClick={sendChatMessage}
+            disabled={chatLoading || !chatInput.trim()}
+            className="bg-indigo-600 text-white p-2 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            aria-label="Send message"
+          >
+            <Send className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   if (showConfig) {
     return (
@@ -192,7 +380,7 @@ export default function ClientDatabase() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8 pb-24">
       <div className="max-w-7xl mx-auto">
         {/* Header */}
         <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
@@ -345,7 +533,13 @@ export default function ClientDatabase() {
             </div>
           </div>
         )}
+
+        {/* Chat Components - Always render */}
+        {!showChat && renderChatButton()}
+        {showChat && renderChatWindow()}
       </div>
     </div>
   );
 }
+
+export default ClientDatabase;
