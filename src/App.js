@@ -8,11 +8,9 @@ import {
   RefreshCw,
   MessageCircle,
   Send,
-  Minimize2,
-  Mail,
 } from 'lucide-react';
 
-export default function ClientDatabase() {
+function App() {
   const [clients, setClients] = useState([]);
   const [filteredClients, setFilteredClients] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -33,6 +31,10 @@ export default function ClientDatabase() {
   const [availableFilters, setAvailableFilters] = useState([]);
   const [showFilters, setShowFilters] = useState(false);
 
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1);
+  const clientsPerPage = 10;
+
   // Chat states
   const [showChat, setShowChat] = useState(false);
   const [chatMessages, setChatMessages] = useState([]);
@@ -42,11 +44,10 @@ export default function ClientDatabase() {
   const [showOpenAIConfig, setShowOpenAIConfig] = useState(false);
   const chatEndRef = useRef(null);
 
-  // Email campaign states
+  // Email campaign state
   const [emailCampaign, setEmailCampaign] = useState(null);
   const [showEmailPreview, setShowEmailPreview] = useState(false);
 
-  // Scroll to bottom of chat
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -55,7 +56,33 @@ export default function ClientDatabase() {
     scrollToBottom();
   }, [chatMessages]);
 
-  // Fetch clients from Airtable
+  // Load config from localStorage
+  useEffect(() => {
+    const savedConfig = localStorage.getItem('airtableConfig');
+    if (savedConfig) {
+      setConfig(JSON.parse(savedConfig));
+      setShowConfig(false);
+    }
+
+    const savedOpenAIKey = localStorage.getItem('openaiKey');
+    if (savedOpenAIKey) {
+      setOpenaiKey(savedOpenAIKey);
+    }
+  }, []);
+
+  // Save Airtable config
+  const saveConfig = () => {
+    localStorage.setItem('airtableConfig', JSON.stringify(config));
+    setShowConfig(false);
+  };
+
+  // Save OpenAI config
+  const saveOpenAIConfig = () => {
+    localStorage.setItem('openaiKey', openaiKey);
+    setShowOpenAIConfig(false);
+  };
+
+  // Fetch ALL clients from Airtable (handle offset pagination)
   const fetchClients = async () => {
     if (!config.apiKey || !config.baseId || !config.tableName) {
       setError('Please configure all Airtable settings');
@@ -66,32 +93,45 @@ export default function ClientDatabase() {
     setError('');
 
     try {
-      const response = await fetch(
-        `https://api.airtable.com/v0/${config.baseId}/${encodeURIComponent(
+      const headers = {
+        Authorization: `Bearer ${config.apiKey}`,
+      };
+
+      let allRecords = [];
+      let offset;
+
+      do {
+        let url = `https://api.airtable.com/v0/${config.baseId}/${encodeURIComponent(
           config.tableName,
-        )}`,
-        {
-          headers: {
-            Authorization: `Bearer ${config.apiKey}`,
-          },
-        },
-      );
+        )}?pageSize=100`;
 
-      if (!response.ok) {
-        throw new Error(`Error: ${response.status} - ${response.statusText}`);
-      }
+        if (offset) {
+          url += `&offset=${offset}`;
+        }
 
-      const data = await response.json();
-      setClients(data.records);
-      setFilteredClients(data.records);
+        const response = await fetch(url, { headers });
 
-      if (data.records.length > 0) {
-        const fields = Object.keys(data.records[0].fields);
+        if (!response.ok) {
+          throw new Error(`Error: ${response.status} - ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        allRecords = allRecords.concat(data.records || []);
+        offset = data.offset;
+      } while (offset);
+
+      setClients(allRecords);
+      setFilteredClients(allRecords);
+      setCurrentPage(1);
+
+      if (allRecords.length > 0) {
+        const fields = Object.keys(allRecords[0].fields);
         setAvailableFilters(fields);
       }
 
       setShowConfig(false);
     } catch (err) {
+      console.error(err);
       setError(err.message);
     } finally {
       setLoading(false);
@@ -115,6 +155,7 @@ export default function ClientDatabase() {
             fields.Name ||
             fields.name ||
             fields['First Name'] ||
+            fields['FULL_NAME'] ||
             'Client',
           clientData: fields,
         });
@@ -127,256 +168,135 @@ export default function ClientDatabase() {
   const extractClientNamesFromPrompt = (prompt) => {
     const lowerPrompt = prompt.toLowerCase();
     const clientNames = [];
-    
-    // Check each client's name against the prompt
+
     filteredClients.forEach((client) => {
       const fields = client.fields;
-      const name = fields.Name || fields.name || fields['First Name'] || '';
+      const name =
+        fields.Name ||
+        fields.name ||
+        fields['First Name'] ||
+        fields['FULL_NAME'] ||
+        '';
       if (name && lowerPrompt.includes(name.toLowerCase())) {
         clientNames.push(name);
       }
     });
-    
+
     return clientNames;
   };
 
-  // Generate email campaign
+  // Generate email campaign via OpenAI
   const generateEmailCampaign = async (prompt) => {
     if (!openaiKey) {
-      setShowOpenAIConfig(true);
-      return null;
-    }
-
-    setChatLoading(true);
-
-    try {
-      // Check if user specified specific clients
-      const specifiedNames = extractClientNamesFromPrompt(prompt);
-      let recipients = extractEmails();
-      
-      // Filter recipients if specific names were mentioned
-      if (specifiedNames.length > 0) {
-        recipients = recipients.filter(r => 
-          specifiedNames.some(name => r.name.toLowerCase().includes(name.toLowerCase()))
-        );
-      }
-
-      if (recipients.length === 0) {
-        throw new Error(
-          'No email addresses found for the specified clients. Make sure your table has an email field.',
-        );
-      }
-
-      const systemMessage = {
-        role: 'system',
-        content: `You are an expert email copywriter. Generate professional, personalized email content based on the user's request. Return ONLY a JSON object with this exact structure:
-{
-  "subject": "Email subject line",
-  "body": "Email body content",
-  "usePersonalization": true/false
-}
-
-The body should be professional, engaging, and appropriate for the context. If usePersonalization is true, use {{name}} as a placeholder where the recipient's name should appear.`,
-      };
-
-      const response = await fetch(
-        'https://api.openai.com/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${openaiKey}`,
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              systemMessage,
-              {
-                role: 'user',
-                content: `Generate an email for: ${prompt}\n\nRecipient count: ${recipients.length}`,
-              },
-            ],
-            max_tokens: 1500,
-            temperature: 0.7,
-          }),
-        },
-      );
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(
-          errorData.error?.message || 'Failed to generate email',
-        );
-      }
-
-      const data = await response.json();
-      let emailContent = data.choices[0].message.content;
-
-      // Clean up the response - remove markdown code blocks if present
-      emailContent = emailContent
-        .replace(/```json\n?/g, '')
-        .replace(/```\n?/g, '')
-        .trim();
-
-      const emailData = JSON.parse(emailContent);
-
-      setEmailCampaign({
-        subject: emailData.subject,
-        body: emailData.body,
-        recipients: recipients,
-        usePersonalization: emailData.usePersonalization,
-      });
-
-      setShowEmailPreview(true);
-
-      return {
-        role: 'assistant',
-        content: `✅ Email campaign created!\n\n📧 Recipients: ${recipients.length}\n📝 Subject: ${emailData.subject}\n\nClick "Preview Campaign" below to review and send.`,
-        showPreviewButton: true,
-      };
-    } catch (err) {
-      throw new Error(`Failed to generate email: ${err.message}`);
-    } finally {
-      setChatLoading(false);
-    }
-  };
-
-  // Send emails via mailto link
-  const sendEmails = async () => {
-    if (!emailCampaign) return;
-
-    try {
-      // Prepare recipients list
-      const toList = emailCampaign.recipients.map(r => r.email).join(',');
-      
-      // Prepare body - use first recipient's name for personalization preview
-      let emailBody = emailCampaign.body;
-      if (emailCampaign.usePersonalization && emailCampaign.recipients.length > 0) {
-        // Note in body about personalization
-        emailBody = `[Note: This template uses {{name}} for personalization. Replace with actual names when sending individually]\n\n${emailBody}`;
-      }
-      
-      // Encode subject and body for URL
-      const subject = encodeURIComponent(emailCampaign.subject);
-      const body = encodeURIComponent(emailBody);
-      
-      // Create mailto link
-      const mailtoLink = `mailto:${toList}?subject=${subject}&body=${body}`;
-      
-      // Open default email client
-      window.location.href = mailtoLink;
-      
-      // Show success message
-      alert(`Opening email client with ${emailCampaign.recipients.length} recipients...`);
-      
-    } catch (err) {
-      alert(`Error opening email client: ${err.message}`);
-    }
-  };
-
-  // Send message to OpenAI (chat)
-  const sendChatMessage = async () => {
-    if (!chatInput.trim()) return;
-
-    if (!openaiKey) {
+      setError('Please configure your OpenAI API key first');
       setShowOpenAIConfig(true);
       return;
     }
 
-    const userMessage = chatInput.trim();
-    setChatInput('');
-
-    const newMessages = [
-      ...chatMessages,
-      { role: 'user', content: userMessage },
-    ];
-    setChatMessages(newMessages);
     setChatLoading(true);
+    setError('');
 
     try {
-      const lower = userMessage.toLowerCase();
-      const isEmailRequest =
-        lower.includes('email') ||
-        lower.includes('send') ||
-        lower.includes('campaign');
+      const emails = extractEmails();
+      extractClientNamesFromPrompt(prompt); // currently not used, but kept for future customization
 
-      if (
-        isEmailRequest &&
-        (lower.includes('generate') ||
-          lower.includes('create') ||
-          lower.includes('send to') ||
-          lower.includes('write'))
-      ) {
-        const emailResponse = await generateEmailCampaign(userMessage);
-        if (emailResponse) {
-          setChatMessages([...newMessages, emailResponse]);
-        }
-        return;
-      }
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'user', content: prompt },
+      ]);
 
-      const dataContext = {
-        totalClients: clients.length,
-        filteredClients: filteredClients.length,
-        availableFields: availableFilters,
-        sampleData: clients.slice(0, 3).map((c) => c.fields),
-      };
+      const systemPrompt = `You are an AI assistant specialized in writing professional and personalized email campaigns.
+You will receive high-level instructions from the user about an email campaign to send to a list of clients.
 
-      const systemMessage = {
-        role: 'system',
-        content: `You are a helpful assistant for a client database with email campaign capabilities. 
+Output MUST be valid JSON with exactly this structure:
+{
+  "subject": "string",
+  "previewText": "string",
+  "bodyHtml": "string",
+  "bodyText": "string"
+}
 
-Current context:
-- Total clients in database: ${dataContext.totalClients}
-- Currently filtered/visible clients: ${dataContext.filteredClients}
-- Available fields: ${dataContext.availableFields.join(', ')}
+- subject: catchy subject line
+- previewText: short preview line
+- bodyHtml: HTML email body (<p>, <strong>, <ul>, etc.)
+- bodyText: same content as plain text
+Do NOT include backticks, markdown fences, or anything other than the JSON.`;
 
-Capabilities:
-1. Answer questions about the database and statistics
-2. Generate email campaigns for the currently filtered clients
+      const limitedClientInfo = emails.slice(0, 10).map((e, index) => ({
+        index: index + 1,
+        name: e.name,
+        email: e.email,
+      }));
 
-For email campaigns: If the user wants to send emails to clients, you can generate an email campaign. They should specify what type of email they want (e.g., "Generate a promotional email about our new product" or "Create a follow-up email" or "Write a newsletter").
-
-When they ask about email campaigns, explain that you can generate emails for the ${dataContext.filteredClients} currently filtered clients.`,
-      };
-
-      const response = await fetch(
-        'https://api.openai.com/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${openaiKey}`,
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [systemMessage, ...newMessages],
-            max_tokens: 1000,
-            temperature: 0.7,
-          }),
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${openaiKey}`,
         },
-      );
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            {
+              role: 'user',
+              content: `User instructions: ${prompt}\n\nExample recipients:\n${JSON.stringify(
+                limitedClientInfo,
+                null,
+                2,
+              )}`,
+            },
+          ],
+          temperature: 0.7,
+        }),
+      });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(
-          errorData.error?.message ||
-            'Failed to get response from OpenAI',
-        );
+        const data = await response.json().catch(() => ({}));
+        console.error('OpenAI error', data);
+        throw new Error(`OpenAI API error: ${response.status}`);
       }
 
       const data = await response.json();
-      const assistantMessage = data.choices[0].message.content;
+      const content = data.choices?.[0]?.message?.content;
 
-      setChatMessages([
-        ...newMessages,
-        { role: 'assistant', content: assistantMessage },
-      ]);
-    } catch (err) {
-      setChatMessages([
-        ...newMessages,
+      if (!content) {
+        throw new Error('No content returned from OpenAI');
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        const match = content.match(/\{[\s\S]*\}/);
+        if (!match) throw new Error('Failed to parse JSON from OpenAI');
+        parsed = JSON.parse(match[0]);
+      }
+
+      setEmailCampaign({
+        ...parsed,
+        recipients: emails,
+      });
+
+      setChatMessages((prev) => [
+        ...prev,
         {
           role: 'assistant',
-          content: `Error: ${err.message}. Please check your OpenAI API key and try again.`,
+          content:
+            'I generated an email campaign. You can review it in the preview panel.',
+        },
+      ]);
+      setShowEmailPreview(true);
+    } catch (err) {
+      console.error(err);
+      setError(err.message || 'Failed to generate email campaign.');
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content:
+            'I encountered an error while generating the email campaign.',
+          error: true,
         },
       ]);
     } finally {
@@ -384,11 +304,11 @@ When they ask about email campaigns, explain that you can generate emails for th
     }
   };
 
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendChatMessage();
-    }
+  const handleChatSend = async () => {
+    if (!chatInput.trim()) return;
+    const msg = chatInput.trim();
+    setChatInput('');
+    await generateEmailCampaign(msg);
   };
 
   // Apply search and filters
@@ -415,6 +335,7 @@ When they ask about email campaigns, explain that you can generate emails for th
     });
 
     setFilteredClients(results);
+    setCurrentPage(1);
   }, [searchTerm, filters, clients]);
 
   const handleFilterChange = (field, value) => {
@@ -427,6 +348,21 @@ When they ask about email campaigns, explain that you can generate emails for th
   const clearFilters = () => {
     setFilters({});
     setSearchTerm('');
+    setCurrentPage(1);
+  };
+
+  // Pagination helpers
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredClients.length / clientsPerPage),
+  );
+  const startIndex = (currentPage - 1) * clientsPerPage;
+  const endIndex = startIndex + clientsPerPage;
+  const paginatedClients = filteredClients.slice(startIndex, endIndex);
+
+  const goToPage = (page) => {
+    const safe = Math.min(Math.max(page, 1), totalPages);
+    setCurrentPage(safe);
   };
 
   // CONFIG SCREEN
@@ -436,89 +372,99 @@ When they ask about email campaigns, explain that you can generate emails for th
         <div className="max-w-2xl mx-auto">
           <div className="bg-white rounded-2xl shadow-xl p-8">
             <div className="flex items-center gap-3 mb-6">
-              <Database className="w-8 h-8 text-indigo-600" />
-              <h1 className="text-3xl font-bold text-gray-800">
-                Configure Airtable Connection
-              </h1>
+              <div className="p-3 bg-indigo-100 rounded-xl">
+                <Database className="w-6 h-6 text-indigo-600" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold text-gray-900">
+                  Connect to Airtable
+                </h1>
+                <p className="text-sm text-gray-500 mt-1">
+                  Enter your Airtable API details to load your client database.
+                </p>
+              </div>
             </div>
 
-            <div className="space-y-6">
+            {error && (
+              <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 flex gap-2 items-center">
+                <AlertCircle className="w-4 h-4 text-red-500" />
+                <span className="text-sm text-red-700">{error}</span>
+              </div>
+            )}
+
+            <div className="space-y-4">
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  API Key
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Airtable API Key
                 </label>
                 <input
                   type="password"
                   value={config.apiKey}
                   onChange={(e) =>
-                    setConfig({ ...config, apiKey: e.target.value })
+                    setConfig((prev) => ({ ...prev, apiKey: e.target.value }))
                   }
-                  placeholder="patXXXXXXXXXXXXXX.XXXXXXXXXXXXXXX"
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none transition"
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  placeholder="patXXXXXXXXXXXX"
                 />
-                <p className="text-xs text-gray-500 mt-1">
-                  Get your API key from Airtable Account Settings → API
-                </p>
               </div>
 
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Base ID
-                </label>
-                <input
-                  type="text"
-                  value={config.baseId}
-                  onChange={(e) =>
-                    setConfig({ ...config, baseId: e.target.value })
-                  }
-                  placeholder="appXXXXXXXXXXXXXX"
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none transition"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Found in your Airtable base URL
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Table ID
-                </label>
-                <input
-                  type="text"
-                  value={config.tableName}
-                  onChange={(e) =>
-                    setConfig({ ...config, tableName: e.target.value })
-                  }
-                  placeholder="tblXXXXXXXXXXXXXX"
-                  className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none transition"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Use the table ID (e.g., tblJvG4VJliD3bAZj) from your
-                  Airtable URL
-                </p>
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded">
-                  <div className="flex items-center gap-2">
-                    <AlertCircle className="w-5 h-5 text-red-500" />
-                    <p className="text-red-700 text-sm">{error}</p>
-                  </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Base ID
+                  </label>
+                  <input
+                    type="text"
+                    value={config.baseId}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, baseId: e.target.value }))
+                    }
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    placeholder="appXXXXXXXXXXXX"
+                  />
                 </div>
-              )}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Table Name
+                  </label>
+                  <input
+                    type="text"
+                    value={config.tableName}
+                    onChange={(e) =>
+                      setConfig((prev) => ({
+                        ...prev,
+                        tableName: e.target.value,
+                      }))
+                    }
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    placeholder="Clients"
+                  />
+                </div>
+              </div>
+            </div>
 
+            <div className="mt-8 flex justify-between items-center">
+              <button
+                onClick={saveConfig}
+                className="px-4 py-2 rounded-lg border border-gray-200 text-gray-600 text-sm hover:bg-gray-50"
+              >
+                Save Settings
+              </button>
               <button
                 onClick={fetchClients}
                 disabled={loading}
-                className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:opacity-50"
               >
                 {loading ? (
                   <>
-                    <RefreshCw className="w-5 h-5 animate-spin" />
+                    <RefreshCw className="w-4 h-4 animate-spin" />
                     Connecting...
                   </>
                 ) : (
-                  'Connect to Airtable'
+                  <>
+                    <Database className="w-4 h-4" />
+                    Connect &amp; Load Clients
+                  </>
                 )}
               </button>
             </div>
@@ -533,75 +479,78 @@ When they ask about email campaigns, explain that you can generate emails for th
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
       <div className="max-w-7xl mx-auto">
         {/* Header */}
-        <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
-          <div className="flex items-center justify-between mb-6">
-            <div className="flex items-center gap-3">
-              <Database className="w-8 h-8 text-indigo-600" />
-              <h1 className="text-3xl font-bold text-gray-800">
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between mb-8 gap-4">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-indigo-100 rounded-xl">
+              <Database className="w-6 h-6 text-indigo-600" />
+            </div>
+            <div>
+              <h1 className="text-3xl font-bold text-gray-900">
                 Client Database
               </h1>
+              <p className="text-sm text-gray-500">
+                Connected to your Airtable base. Search, filter, and manage your
+                clients.
+              </p>
             </div>
+          </div>
+
+          <div className="flex flex-wrap gap-3 items-center">
             <button
               onClick={() => setShowConfig(true)}
-              className="text-sm text-indigo-600 hover:text-indigo-800 font-medium"
+              className="px-4 py-2 rounded-lg border border-gray-200 text-gray-700 text-sm hover:bg-white bg-white/70"
             >
               Change Connection
             </button>
-          </div>
 
-          {/* Search Bar */}
-          <div className="relative mb-4">
-            <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
-            <input
-              type="text"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Search clients..."
-              className="w-full pl-12 pr-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none transition"
-            />
-          </div>
-
-          {/* Filter Controls */}
-          <div className="flex items-center gap-4">
             <button
-              onClick={() => setShowFilters(!showFilters)}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition"
+              onClick={() => setShowOpenAIConfig(true)}
+              className="px-4 py-2 rounded-lg border border-indigo-200 text-indigo-700 text-sm bg-indigo-50 hover:bg-indigo-100 flex items-center gap-2"
+            >
+              <MessageCircle className="w-4 h-4" />
+              OpenAI Settings
+            </button>
+          </div>
+        </div>
+
+        {/* Search Bar & Filters */}
+        <div className="bg-white rounded-2xl shadow-lg p-4 mb-6">
+          <div className="flex flex-col md:flex-row gap-3 md:items-center">
+            <div className="flex-1 relative">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="Search clients..."
+                className="w-full pl-10 pr-4 py-2 border border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none transition"
+              />
+            </div>
+
+            <button
+              onClick={() => setShowFilters((prev) => !prev)}
+              className="flex items-center gap-2 px-4 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50"
             >
               <Filter className="w-4 h-4" />
               Filters
-              {Object.values(filters).filter((v) => v).length > 0 && (
-                <span className="bg-indigo-600 text-white text-xs px-2 py-1 rounded-full">
-                  {Object.values(filters).filter((v) => v).length}
-                </span>
-              )}
             </button>
 
-            {(searchTerm ||
-              Object.values(filters).some((v) => v)) && (
+            {(searchTerm || Object.keys(filters).length > 0) && (
               <button
                 onClick={clearFilters}
-                className="flex items-center gap-2 px-4 py-2 text-gray-600 hover:text-gray-800 transition"
+                className="flex items-center gap-1 px-3 py-2 text-sm text-gray-500 hover:text-gray-700"
               >
                 <X className="w-4 h-4" />
-                Clear all
+                Clear
               </button>
             )}
-
-            <button
-              onClick={fetchClients}
-              className="flex items-center gap-2 px-4 py-2 text-indigo-600 hover:text-indigo-800 transition ml-auto"
-            >
-              <RefreshCw className="w-4 h-4" />
-              Refresh
-            </button>
           </div>
 
-          {/* Filter Panel */}
-          {showFilters && (
-            <div className="mt-4 p-4 bg-gray-50 rounded-lg grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {showFilters && availableFilters.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-gray-100 grid grid-cols-1 md:grid-cols-3 gap-3">
               {availableFilters.map((field) => (
                 <div key={field}>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                  <label className="block text-xs font-semibold text-gray-500 mb-1">
                     {field}
                   </label>
                   <input
@@ -610,8 +559,8 @@ When they ask about email campaigns, explain that you can generate emails for th
                     onChange={(e) =>
                       handleFilterChange(field, e.target.value)
                     }
-                    placeholder={`Filter by ${field}...`}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:border-indigo-500 focus:outline-none text-sm"
+                    placeholder={`Filter by ${field}`}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-md text-sm focus:border-indigo-500 focus:outline-none"
                   />
                 </div>
               ))}
@@ -622,17 +571,28 @@ When they ask about email campaigns, explain that you can generate emails for th
         {/* Results Count */}
         <div className="mb-4 flex items-center justify-between">
           <span className="text-gray-600">
-            Showing {filteredClients.length} of {clients.length} clients
+            {filteredClients.length > 0 ? (
+              <>
+                Showing {startIndex + 1}–
+                {Math.min(endIndex, filteredClients.length)} of{' '}
+                {filteredClients.length} filtered clients
+                {clients.length !== filteredClients.length &&
+                  ` (total in base: ${clients.length})`}
+              </>
+            ) : (
+              <>Showing 0 of {clients.length} clients</>
+            )}
           </span>
+
           {filteredClients.length > 0 && (
             <button
               onClick={() => {
                 setShowChat(true);
                 setChatMessages([]);
               }}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition text-sm font-medium"
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition text-sm"
             >
-              <Mail className="w-4 h-4" />
+              <MessageCircle className="w-4 h-4" />
               Create Email Campaign
             </button>
           )}
@@ -640,7 +600,7 @@ When they ask about email campaigns, explain that you can generate emails for th
 
         {/* Client Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {filteredClients.map((client) => (
+          {paginatedClients.map((client) => (
             <div
               key={client.id}
               onClick={() => setSelectedClient(client)}
@@ -660,55 +620,93 @@ When they ask about email campaigns, explain that you can generate emails for th
           ))}
         </div>
 
+        {/* Pagination controls */}
+        {filteredClients.length > 0 && (
+          <div className="flex items-center justify-center gap-4 mt-6">
+            <button
+              onClick={() => goToPage(currentPage - 1)}
+              disabled={currentPage === 1}
+              className="px-4 py-2 text-sm rounded-lg border border-gray-300 bg-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+            >
+              Previous
+            </button>
+            <span className="text-sm text-gray-600">
+              Page {currentPage} of {totalPages}
+            </span>
+            <button
+              onClick={() => goToPage(currentPage + 1)}
+              disabled={currentPage === totalPages}
+              className="px-4 py-2 text-sm rounded-lg border border-gray-300 bg-white disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+            >
+              Next
+            </button>
+          </div>
+        )}
+
+        {/* No results */}
         {filteredClients.length === 0 && !loading && (
-          <div className="text-center py-12 bg-white rounded-xl shadow-lg">
+          <div className="text-center py-12 bg-white rounded-xl shadow-lg mt-6">
             <AlertCircle className="w-12 h-12 text-gray-400 mx-auto mb-4" />
             <p className="text-gray-600 text-lg">No clients found</p>
             <p className="text-gray-400 text-sm mt-2">
-              Try adjusting your search or filters
+              Try adjusting your search or filters.
             </p>
           </div>
         )}
 
         {/* Client Detail Modal */}
         {selectedClient && (
-          <div
-            className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50"
-            onClick={() => setSelectedClient(null)}
-          >
-            <div
-              className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-y-auto p-8"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-2xl font-bold text-gray-800">
-                  Client Details
-                </h2>
+          <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-40">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-hidden">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 bg-indigo-100 rounded-lg">
+                    <Database className="w-4 h-4 text-indigo-600" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-900">
+                      Client Details
+                    </h2>
+                    <p className="text-xs text-gray-500">
+                      ID: {selectedClient.id}
+                    </p>
+                  </div>
+                </div>
                 <button
                   onClick={() => setSelectedClient(null)}
-                  className="text-gray-400 hover:text-gray-600"
+                  className="p-1 rounded-full hover:bg-gray-100"
                 >
-                  <X className="w-6 h-6" />
+                  <X className="w-4 h-4 text-gray-500" />
                 </button>
               </div>
-              <div className="space-y-4">
-                {Object.entries(selectedClient.fields).map(
-                  ([key, value]) => (
+
+              <div className="p-6 overflow-y-auto max-h-[60vh]">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {Object.entries(selectedClient.fields).map(([key, value]) => (
                     <div
                       key={key}
-                      className="border-b border-gray-200 pb-3"
+                      className="bg-gray-50 rounded-lg p-3 border border-gray-100"
                     >
-                      <span className="text-sm font-semibold text-gray-500 uppercase tracking-wide">
+                      <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
                         {key}
-                      </span>
-                      <p className="text-gray-800 mt-1 text-lg break-words">
+                      </div>
+                      <div className="text-sm text-gray-800 break-words">
                         {Array.isArray(value)
                           ? value.join(', ')
                           : String(value)}
-                      </p>
+                      </div>
                     </div>
-                  ),
-                )}
+                  ))}
+                </div>
+              </div>
+
+              <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 flex justify-end">
+                <button
+                  onClick={() => setSelectedClient(null)}
+                  className="px-4 py-2 text-sm rounded-lg border border-gray-200 text-gray-600 hover:bg-white"
+                >
+                  Close
+                </button>
               </div>
             </div>
           </div>
@@ -716,153 +714,220 @@ When they ask about email campaigns, explain that you can generate emails for th
 
         {/* Email Preview Modal */}
         {showEmailPreview && emailCampaign && (
-          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-            <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
-              <div className="sticky top-0 bg-white border-b p-6 rounded-t-2xl">
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-2xl font-bold text-gray-800">
-                    📧 Email Campaign Preview
-                  </h2>
-                  <button
-                    onClick={() => setShowEmailPreview(false)}
-                    className="text-gray-400 hover:text-gray-600"
-                  >
-                    <X className="w-6 h-6" />
-                  </button>
+          <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-40">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden">
+              {/* header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 bg-indigo-100 rounded-lg">
+                    <MessageCircle className="w-4 h-4 text-indigo-600" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-900">
+                      Email Campaign Preview
+                    </h2>
+                    <p className="text-xs text-gray-500">
+                      Subject: {emailCampaign.subject}
+                    </p>
+                  </div>
                 </div>
-                <div className="bg-indigo-50 p-4 rounded-lg">
-                  <p className="text-sm text-gray-700">
-                    <strong>Recipients:</strong>{' '}
-                    {emailCampaign.recipients.length} filtered clients
-                  </p>
+                <button
+                  onClick={() => setShowEmailPreview(false)}
+                  className="p-1 rounded-full hover:bg-gray-100"
+                >
+                  <X className="w-4 h-4 text-gray-500" />
+                </button>
+              </div>
+
+              <div className="flex flex-col md:flex-row h-[70vh]">
+                <div className="w-full md:w-2/3 p-6 overflow-y-auto border-b md:border-b-0 md:border-r border-gray-100">
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+                      Subject
+                    </div>
+                    <div className="text-sm text-gray-900">
+                      {emailCampaign.subject}
+                    </div>
+                  </div>
+
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+                      Preview Text
+                    </div>
+                    <div className="text-sm text-gray-900">
+                      {emailCampaign.previewText}
+                    </div>
+                  </div>
+
+                  <div className="mb-4">
+                    <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+                      HTML Body
+                    </div>
+                    <div className="text-sm text-gray-800 border border-gray-100 rounded-lg p-3 bg-gray-50">
+                      <div
+                        dangerouslySetInnerHTML={{
+                          __html: emailCampaign.bodyHtml,
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+                      Plain Text Body
+                    </div>
+                    <pre className="text-xs text-gray-800 border border-gray-100 rounded-lg p-3 bg-gray-50 whitespace-pre-wrap">
+                      {emailCampaign.bodyText}
+                    </pre>
+                  </div>
+                </div>
+
+                <div className="w-full md:w-1/3 p-6 bg-gray-50 overflow-y-auto">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-sm font-semibold text-gray-900">
+                      Recipients
+                    </h3>
+                    <span className="text-xs px-2 py-1 rounded-full bg-indigo-100 text-indigo-700">
+                      {emailCampaign.recipients.length} clients
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {emailCampaign.recipients
+                      .slice(0, 20)
+                      .map((recipient, index) => (
+                        <div
+                          key={index}
+                          className="bg-white rounded-lg p-3 shadow-sm border border-gray-100"
+                        >
+                          <div className="text-sm font-medium text-gray-900">
+                            {recipient.name || 'Unnamed Client'}
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            {recipient.email}
+                          </div>
+                        </div>
+                      ))}
+                    {emailCampaign.recipients.length > 20 && (
+                      <div className="text-xs text-gray-500 text-center pt-2">
+                        +
+                        {emailCampaign.recipients.length - 20} more
+                        recipients...
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              <div className="p-6 space-y-6">
-                {/* Email Content */}
-                <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">
-                    Subject Line
-                  </label>
-                  <input
-                    type="text"
-                    value={emailCampaign.subject}
-                    onChange={(e) =>
-                      setEmailCampaign({
-                        ...emailCampaign,
-                        subject: e.target.value,
-                      })
-                    }
-                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none"
-                  />
-                </div>
+              <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 flex justify-between items-center">
+                <p className="text-xs text-gray-500">
+                  You can export this content into your email tool. The content
+                  is ready for a mass email campaign.
+                </p>
+                <button
+                  onClick={() => setShowEmailPreview(false)}
+                  className="px-4 py-2 text-sm rounded-lg border border-gray-200 text-gray-600 hover:bg-white"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
-                <div>
-                  <label className="block text-sm font-semibold text-gray-700 mb-2">
-                    Email Body
-                    {emailCampaign.usePersonalization && (
-                      <span className="ml-2 text-xs text-indigo-600">
-                        (Use {'{{name}}'} for personalization)
-                      </span>
-                    )}
-                  </label>
+        {/* Chat Panel */}
+        {showChat && (
+          <div className="fixed bottom-4 right-4 w-full max-w-md z-50">
+            <div className="bg-white rounded-2xl shadow-2xl overflow-hidden border border-gray-100">
+              <div className="flex items-center justify-between px-4 py-2 bg-indigo-600 text-white">
+                <div className="flex items-center gap-2">
+                  <MessageCircle className="w-4 h-4" />
+                  <span className="text-sm font-medium">
+                    Email Campaign Assistant
+                  </span>
+                </div>
+                <button
+                  onClick={() => setShowChat(false)}
+                  className="p-1 rounded-full hover:bg-indigo-500"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="h-72 overflow-y-auto p-4 space-y-3 bg-gray-50">
+                {chatMessages.length === 0 && (
+                  <div className="text-xs text-gray-500 bg-white rounded-lg p-3 shadow-sm border border-gray-100">
+                    <p className="font-medium text-gray-700 mb-1">
+                      How it works
+                    </p>
+                    <p>
+                      Describe the email campaign you want to create (for
+                      example: &ldquo;Write an intro email to all data science
+                      professionals, inviting them to a free consultation.&rdquo;)
+                    </p>
+                  </div>
+                )}
+
+                {chatMessages.map((msg, i) => (
+                  <div
+                    key={i}
+                    className={`flex ${
+                      msg.role === 'user' ? 'justify-end' : 'justify-start'
+                    }`}
+                  >
+                    <div
+                      className={`max-w-[80%] rounded-2xl px-3 py-2 text-xs shadow-sm ${
+                        msg.role === 'user'
+                          ? 'bg-indigo-600 text-white rounded-br-none'
+                          : msg.error
+                          ? 'bg-red-50 text-red-700 rounded-bl-none'
+                          : 'bg-white text-gray-800 rounded-bl-none'
+                      }`}
+                    >
+                      {msg.content}
+                    </div>
+                  </div>
+                ))}
+
+                {chatLoading && (
+                  <div className="flex justify-start">
+                    <div className="bg-white text-gray-500 rounded-2xl rounded-bl-none px-3 py-2 text-xs shadow-sm flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full bg-gray-300 animate-pulse" />
+                      <span className="w-2 h-2 rounded-full bg-gray-300 animate-pulse delay-75" />
+                      <span className="w-2 h-2 rounded-full bg-gray-300 animate-pulse delay-150" />
+                    </div>
+                  </div>
+                )}
+
+                <div ref={chatEndRef} />
+              </div>
+
+              <div className="border-t border-gray-100 p-3 bg-white">
+                <div className="flex items-end gap-2">
                   <textarea
-                    value={emailCampaign.body}
-                    onChange={(e) =>
-                      setEmailCampaign({
-                        ...emailCampaign,
-                        body: e.target.value,
-                      })
-                    }
-                    rows={12}
-                    className="w-full px-4 py-3 border-2 border-gray-200 rounded-lg focus:border-indigo-500 focus:outline-none font-mono text-sm"
+                    rows={1}
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleChatSend();
+                      }
+                    }}
+                    className="flex-1 text-xs px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 resize-none"
+                    placeholder="Describe the email campaign you want to create..."
                   />
-                </div>
-
-                {/* Preview for first recipient */}
-                <div className="border-t pt-6">
-                  <h3 className="text-lg font-semibold text-gray-800 mb-3">
-                    Preview (First Recipient)
-                  </h3>
-                  <div className="bg-gray-50 p-6 rounded-lg">
-                    <div className="mb-4">
-                      <p className="text-xs text-gray-500 mb-1">To:</p>
-                      <p className="text-sm font-medium">
-                        {emailCampaign.recipients[0].name} &lt;
-                        {emailCampaign.recipients[0].email}&gt;
-                      </p>
-                    </div>
-                    <div className="mb-4">
-                      <p className="text-xs text-gray-500 mb-1">
-                        Subject:
-                      </p>
-                      <p className="text-sm font-medium">
-                        {emailCampaign.subject}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-gray-500 mb-2">Body:</p>
-                      <div className="bg-white p-4 rounded border text-sm whitespace-pre-wrap">
-                        {emailCampaign.usePersonalization
-                          ? emailCampaign.body.replace(
-                              /\{\{name\}\}/g,
-                              emailCampaign.recipients[0].name,
-                            )
-                          : emailCampaign.body}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Recipient List */}
-                <div className="border-t pt-6">
-                  <h3 className="text-lg font-semibold text-gray-800 mb-3">
-                    Recipients ({emailCampaign.recipients.length})
-                  </h3>
-                  <div className="max-h-60 overflow-y-auto bg-gray-50 rounded-lg p-4">
-                    {emailCampaign.recipients.map((recipient, idx) => (
-                      <div
-                        key={idx}
-                        className="flex items-center justify-between py-2 border-b border-gray-200 last:border-0"
-                      >
-                        <div>
-                          <p className="text-xs text-gray-600">
-                            {recipient.email}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Send Button */}
-                <div className="border-t pt-6 flex gap-4">
                   <button
-                    onClick={() => setShowEmailPreview(false)}
-                    className="flex-1 px-6 py-3 border-2 border-gray-300 text-gray-700 rounded-lg font-semibold hover:bg-gray-50 transition"
+                    onClick={handleChatSend}
+                    disabled={chatLoading || !chatInput.trim()}
+                    className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
                   >
-                    Cancel
+                    {chatLoading ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
                   </button>
-                  <button
-                    onClick={sendEmails}
-                    className="flex-1 bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 transition flex items-center justify-center gap-2"
-                  >
-                    <Send className="w-5 h-5" />
-                    Open in Email Client ({emailCampaign.recipients.length} Recipients)
-                  </button>
-                </div>
-
-                {/* Warning Notice */}
-                <div className="bg-blue-50 border-l-4 border-blue-400 p-4 rounded">
-                  <p className="text-sm text-blue-800">
-                    <strong>📧 Email Client Integration:</strong> This will open your default email application with all recipients pre-filled.
-                  </p>
-                  <ul className="text-xs text-blue-700 mt-2 ml-4 list-disc space-y-1">
-                    <li>All {emailCampaign.recipients.length} recipients will be added to the "To" field</li>
-                    <li>Subject and body will be pre-filled</li>
-                    <li>Review and customize before sending</li>
-                    <li>For personalized emails, consider sending individually</li>
-                  </ul>
                 </div>
               </div>
             </div>
@@ -870,161 +935,19 @@ When they ask about email campaigns, explain that you can generate emails for th
         )}
       </div>
 
-      {/* Chat Button */}
-      {!showChat && (
-        <button
-          onClick={() => setShowChat(true)}
-          className="fixed bottom-6 right-6 bg-indigo-600 text-white p-4 rounded-full shadow-2xl hover:bg-indigo-700 transition-all hover:scale-110 z-50"
-        >
-          <MessageCircle className="w-6 h-6" />
-        </button>
-      )}
-
-      {/* Chat Window */}
-      {showChat && (
-        <div className="fixed bottom-6 right-6 w-96 h-[600px] bg-white rounded-2xl shadow-2xl flex flex-col z-50">
-          {/* Chat Header */}
-          <div className="bg-indigo-600 text-white p-4 rounded-t-2xl flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <MessageCircle className="w-5 h-5" />
-              <h3 className="font-semibold">AI Assistant</h3>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowOpenAIConfig(!showOpenAIConfig)}
-                className="text-white hover:text-indigo-200 text-xs"
-              >
-                {openaiKey ? '✓' : 'Configure'}
-              </button>
-              <button
-                onClick={() => setShowChat(false)}
-                className="text-white hover:text-indigo-200"
-              >
-                <Minimize2 className="w-5 h-5" />
-              </button>
-            </div>
-          </div>
-
-          {/* OpenAI Config Panel */}
-          {showOpenAIConfig && (
-            <div className="p-4 bg-indigo-50 border-b">
-              <label className="block text-xs font-semibold text-gray-700 mb-1">
-                OpenAI API Key
-              </label>
-              <input
-                type="password"
-                value={openaiKey}
-                onChange={(e) => setOpenaiKey(e.target.value)}
-                placeholder="sk-..."
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:border-indigo-500 focus:outline-none text-sm"
-              />
-              <p className="text-xs text-gray-500 mt-1">
-                Get your API key from OpenAI
-              </p>
-            </div>
-          )}
-
-          {/* Chat Messages */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {chatMessages.length === 0 && (
-              <div className="text-center text-gray-500 mt-8">
-                <MessageCircle className="w-12 h-12 mx-auto mb-2 text-gray-300" />
-                <p className="text-sm font-medium mb-2">
-                  Ask me anything!
-                </p>
-                <div className="text-xs space-y-1">
-                  <p>💬 "How many clients do we have?"</p>
-                  <p>📧 "Generate a promotional email"</p>
-                  <p>📊 "What fields are available?"</p>
-                </div>
-              </div>
-            )}
-
-            {chatMessages.map((msg, idx) => (
-              <div key={idx}>
-                <div
-                  className={`flex ${
-                    msg.role === 'user'
-                      ? 'justify-end'
-                      : 'justify-start'
-                  }`}
-                >
-                  <div
-                    className={`max-w-[80%] p-3 rounded-lg ${
-                      msg.role === 'user'
-                        ? 'bg-indigo-600 text-white'
-                        : 'bg-gray-100 text-gray-800'
-                    }`}
-                  >
-                    <p className="text-sm whitespace-pre-wrap">
-                      {msg.content}
-                    </p>
-                  </div>
-                </div>
-                {msg.showPreviewButton && emailCampaign && (
-                  <div className="flex justify-start mt-2">
-                    <button
-                      onClick={() => setShowEmailPreview(true)}
-                      className="text-xs bg-indigo-100 text-indigo-700 px-3 py-2 rounded-lg hover:bg-indigo-200 transition flex items-center gap-1"
-                    >
-                      <Mail className="w-3 h-3" />
-                      Preview Campaign
-                    </button>
-                  </div>
-                )}
-              </div>
-            ))}
-
-            {chatLoading && (
-              <div className="flex justify-start">
-                <div className="bg-gray-100 p-3 rounded-lg">
-                  <div className="flex gap-1">
-                    <div
-                      className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                      style={{ animationDelay: '0ms' }}
-                    ></div>
-                    <div
-                      className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                      style={{ animationDelay: '150ms' }}
-                    ></div>
-                    <div
-                      className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                      style={{ animationDelay: '300ms' }}
-                    ></div>
-                  </div>
-                </div>
-              </div>
-            )}
-            <div ref={chatEndRef} />
-          </div>
-
-          {/* Chat Input */}
-          <div className="p-4 border-t">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyPress={handleKeyPress}
-                placeholder="Ask about clients or create emails..."
-                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:border-indigo-500 focus:outline-none text-sm"
-                disabled={chatLoading}
-              />
-              <button
-                onClick={sendChatMessage}
-                disabled={chatLoading || !chatInput.trim()}
-                className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
-              >
-                {chatLoading ? (
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Send className="w-4 h-4" />
-                )}
-              </button>
-            </div>
+      {/* Loading Overlay */}
+      {loading && (
+        <div className="fixed inset-0 bg-black/20 flex items-center justify-center z-40">
+          <div className="bg-white rounded-xl shadow-lg px-4 py-3 flex items-center gap-3">
+            <RefreshCw className="w-4 h-4 text-indigo-600 animate-spin" />
+            <span className="text-sm text-gray-700">
+              Loading clients from Airtable...
+            </span>
           </div>
         </div>
       )}
     </div>
   );
 }
+
+export default App;
