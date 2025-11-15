@@ -8,9 +8,16 @@ import {
   RefreshCw,
   MessageCircle,
   Send,
+  Minimize2,
+  Mail,
+  Trash2,
 } from 'lucide-react';
 
-function App() {
+// Keep requests small for OpenAI
+const MAX_CLIENTS_FOR_AI = 80;      // first 80 filtered clients
+const MAX_RECIPIENTS_FOR_AI = 80;   // first 80 selected recipients shown to AI
+
+export default function ClientDatabase() {
   const [clients, setClients] = useState([]);
   const [filteredClients, setFilteredClients] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -31,9 +38,12 @@ function App() {
   const [availableFilters, setAvailableFilters] = useState([]);
   const [showFilters, setShowFilters] = useState(false);
 
-  // Pagination states
+  // Pagination
   const [currentPage, setCurrentPage] = useState(1);
   const clientsPerPage = 10;
+
+  // Selected clients (checkboxes)
+  const [selectedClientIds, setSelectedClientIds] = useState([]);
 
   // Chat states
   const [showChat, setShowChat] = useState(false);
@@ -44,10 +54,11 @@ function App() {
   const [showOpenAIConfig, setShowOpenAIConfig] = useState(false);
   const chatEndRef = useRef(null);
 
-  // Email campaign state
+  // Email campaign states
   const [emailCampaign, setEmailCampaign] = useState(null);
   const [showEmailPreview, setShowEmailPreview] = useState(false);
 
+  // Scroll chat to bottom
   const scrollToBottom = () => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -56,7 +67,7 @@ function App() {
     scrollToBottom();
   }, [chatMessages]);
 
-  // Load config from localStorage
+  // Load stored configs
   useEffect(() => {
     const savedConfig = localStorage.getItem('airtableConfig');
     if (savedConfig) {
@@ -70,19 +81,17 @@ function App() {
     }
   }, []);
 
-  // Save Airtable config
   const saveConfig = () => {
     localStorage.setItem('airtableConfig', JSON.stringify(config));
     setShowConfig(false);
   };
 
-  // Save OpenAI config
   const saveOpenAIConfig = () => {
     localStorage.setItem('openaiKey', openaiKey);
     setShowOpenAIConfig(false);
   };
 
-  // Fetch ALL clients from Airtable (handle offset pagination)
+  // Fetch ALL Airtable records (handle offset)
   const fetchClients = async () => {
     if (!config.apiKey || !config.baseId || !config.tableName) {
       setError('Please configure all Airtable settings');
@@ -105,12 +114,9 @@ function App() {
           config.tableName,
         )}?pageSize=100`;
 
-        if (offset) {
-          url += `&offset=${offset}`;
-        }
+        if (offset) url += `&offset=${offset}`;
 
         const response = await fetch(url, { headers });
-
         if (!response.ok) {
           throw new Error(`Error: ${response.status} - ${response.statusText}`);
         }
@@ -123,39 +129,58 @@ function App() {
       setClients(allRecords);
       setFilteredClients(allRecords);
       setCurrentPage(1);
+      setSelectedClientIds([]);
 
       if (allRecords.length > 0) {
-        const fields = Object.keys(allRecords[0].fields);
+        const fields = Object.keys(allRecords[0].fields || {});
         setAvailableFilters(fields);
       }
 
       setShowConfig(false);
     } catch (err) {
-      console.error(err);
       setError(err.message);
     } finally {
       setLoading(false);
     }
   };
 
-  // Extract emails from filtered clients
-  const extractEmails = () => {
+  // Checkbox selection
+  const toggleClientSelection = (id) => {
+    setSelectedClientIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  };
+
+  const handleSelectAllFiltered = () => {
+    setSelectedClientIds(filteredClients.map((c) => c.id));
+  };
+
+  const handleDeselectAll = () => {
+    setSelectedClientIds([]);
+  };
+
+  // Helper: pull email/name from a list of records
+  const extractEmailsFromList = (list) => {
     const emails = [];
-    filteredClients.forEach((client) => {
-      const fields = client.fields;
-      const emailField = Object.keys(fields).find(
-        (key) =>
-          key.toLowerCase().includes('email') ||
-          key.toLowerCase() === 'e-mail',
-      );
+    list.forEach((client) => {
+      const fields = client.fields || {};
+      const emailField = Object.keys(fields).find((key) => {
+        const lower = key.toLowerCase();
+        return lower.includes('email') || lower === 'e-mail';
+      });
+
       if (emailField && fields[emailField]) {
         emails.push({
           email: fields[emailField],
           name:
+            fields.FULL_NAME ||
+            fields.full_name ||
+            fields['Full Name'] ||
             fields.Name ||
             fields.name ||
+            fields.FIRST_NAME ||
             fields['First Name'] ||
-            fields['FULL_NAME'] ||
+            fields['first_name'] ||
             'Client',
           clientData: fields,
         });
@@ -164,28 +189,225 @@ function App() {
     return emails;
   };
 
-  // Extract specific client names from prompt
+  // Find names mentioned in user prompt (using filtered clients for now)
   const extractClientNamesFromPrompt = (prompt) => {
     const lowerPrompt = prompt.toLowerCase();
-    const clientNames = [];
+    const names = new Set();
 
     filteredClients.forEach((client) => {
-      const fields = client.fields;
-      const name =
-        fields.Name ||
-        fields.name ||
-        fields['First Name'] ||
-        fields['FULL_NAME'] ||
-        '';
-      if (name && lowerPrompt.includes(name.toLowerCase())) {
-        clientNames.push(name);
-      }
+      const f = client.fields || {};
+      const possibleNames = [
+        f.FULL_NAME,
+        f.full_name,
+        f['Full Name'],
+        f.Name,
+        f.name,
+        f.FIRST_NAME,
+        f['First Name'],
+      ]
+        .filter(Boolean)
+        .map((v) => String(v).toLowerCase());
+
+      possibleNames.forEach((nm) => {
+        if (nm && lowerPrompt.includes(nm)) {
+          names.add(nm);
+        }
+      });
     });
 
-    return clientNames;
+    return Array.from(names);
   };
 
-  // Generate email campaign via OpenAI
+  // MAIN recipient builder
+  // 1) use selected checkboxes; if none selected but names mentioned, fallback to name-matching
+  const extractEmails = (promptText = '') => {
+    let baseList = clients.filter((c) => selectedClientIds.includes(c.id));
+
+    if (baseList.length === 0 && promptText) {
+      // fallback: infer recipients from names in prompt
+      const namesFromPrompt = extractClientNamesFromPrompt(promptText);
+      if (namesFromPrompt.length) {
+        const lowerNames = namesFromPrompt.map((n) => n.toLowerCase());
+        baseList = clients.filter((c) => {
+          const f = c.fields || {};
+          const nameValues = [
+            f.FULL_NAME,
+            f.full_name,
+            f['Full Name'],
+            f.Name,
+            f.name,
+            f.FIRST_NAME,
+            f['First Name'],
+          ]
+            .filter(Boolean)
+            .map((v) => String(v).toLowerCase());
+          return nameValues.some((nv) =>
+            lowerNames.some((ln) => nv.includes(ln)),
+          );
+        });
+      }
+    }
+
+    return extractEmailsFromList(baseList);
+  };
+
+  // Build DB context for the AI (cap + slim fields)
+  const buildDbContext = () => {
+    const selected = filteredClients.filter((c) =>
+      selectedClientIds.includes(c.id),
+    );
+
+    const IMPORTANT_FIELDS = [
+      // names
+      'FULL_NAME',
+      'full_name',
+      'Full Name',
+      'Name',
+      'name',
+      'FIRST_NAME',
+      'First Name',
+      'LAST_NAME',
+      'Last Name',
+      // emails
+      'EMAIL',
+      'Email',
+      'E-mail',
+      'EMAIL1',
+      'EMAIL2',
+      'EMAIL3',
+      // location
+      'PERSON_CITY',
+      'PERSON_STATE',
+      'PERSON_COUNTRY',
+      'City',
+      'State',
+      'Country',
+      // company
+      'COMPANY',
+      'Company',
+    ];
+
+    const slimClient = (c) => {
+      const out = { id: c.id, fields: {} };
+      const f = c.fields || {};
+      IMPORTANT_FIELDS.forEach((key) => {
+        if (f[key] !== undefined) out.fields[key] = f[key];
+      });
+      return out;
+    };
+
+    const slimFiltered = filteredClients
+      .slice(0, MAX_CLIENTS_FOR_AI)
+      .map(slimClient);
+    const slimSelected = selected.slice(0, MAX_CLIENTS_FOR_AI).map(slimClient);
+
+    return {
+      totalClients: clients.length,
+      filteredCount: filteredClients.length,
+      selectedCount: selectedClientIds.length,
+      selectedClientIds,
+      maxClientsForAI: MAX_CLIENTS_FOR_AI,
+      clients: slimFiltered,
+      selectedClients: slimSelected,
+    };
+  };
+
+  // Chat only
+  const sendChatMessage = async () => {
+    if (!chatInput.trim()) return;
+    if (!openaiKey) {
+      setError('Please configure your OpenAI API key first');
+      setShowOpenAIConfig(true);
+      return;
+    }
+
+    const message = chatInput.trim();
+    setChatInput('');
+
+    const userMessage = { role: 'user', content: message };
+    setChatMessages((prev) => [...prev, userMessage]);
+
+    setChatLoading(true);
+    setError('');
+
+    try {
+      const historyMessages = chatMessages.map((m) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: m.content,
+      }));
+
+      const dbContext = buildDbContext();
+
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You are a helpful assistant for client outreach and marketing. You will be given a JSON "client_db_context" that contains summary information and up to 80 filtered clients, each with only key fields (names, emails, company, location). Use it to answer questions. If the user asks about clients beyond what you see, say that you only have access to the first 80 filtered clients.',
+            },
+            {
+              role: 'user',
+              content:
+                'Here is the current client database context (up to 80 filtered clients):\n' +
+                JSON.stringify(dbContext, null, 2),
+            },
+            ...historyMessages,
+            userMessage,
+          ],
+          temperature: 0.7,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        console.error('OpenAI chat error', data);
+        throw new Error(
+          data.error?.message ||
+            `OpenAI API error: ${response.status} ${response.statusText}`,
+        );
+      }
+
+      const content = data.choices?.[0]?.message?.content?.trim();
+      if (!content) throw new Error('No content returned from OpenAI');
+
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content },
+      ]);
+    } catch (err) {
+      console.error(err);
+      setError(err.message || 'Failed to get response from OpenAI.');
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content:
+            'I encountered an error while responding. Please try again or check your API key.\n\nDetails: ' +
+            (err.message || ''),
+          error: true,
+        },
+      ]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const handleChatKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  };
+
+  // Generate email campaign using current chatInput as prompt
   const generateEmailCampaign = async (prompt) => {
     if (!openaiKey) {
       setError('Please configure your OpenAI API key first');
@@ -193,17 +415,28 @@ function App() {
       return;
     }
 
+    const emails = extractEmails(prompt);
+    if (!emails.length) {
+      setError(
+        'No recipients found. Please select at least one client (with an email) or mention a client name clearly in your prompt.',
+      );
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content:
+            'Please select at least one client using the checkboxes, or clearly mention which client(s) you want (for example, “send an email to Tina Cheng”) before asking me to draft a campaign.',
+          error: true,
+        },
+      ]);
+      return;
+    }
+
     setChatLoading(true);
     setError('');
 
     try {
-      const emails = extractEmails();
-      extractClientNamesFromPrompt(prompt); // currently not used, but kept for future customization
-
-      setChatMessages((prev) => [
-        ...prev,
-        { role: 'user', content: prompt },
-      ]);
+      const clientNames = extractClientNamesFromPrompt(prompt);
 
       const systemPrompt = `You are an AI assistant specialized in writing professional and personalized email campaigns.
 You will receive high-level instructions from the user about an email campaign to send to a list of clients.
@@ -222,11 +455,13 @@ Output MUST be valid JSON with exactly this structure:
 - bodyText: same content as plain text
 Do NOT include backticks, markdown fences, or anything other than the JSON.`;
 
-      const limitedClientInfo = emails.slice(0, 10).map((e, index) => ({
-        index: index + 1,
-        name: e.name,
-        email: e.email,
-      }));
+      const fullRecipientInfo = emails
+        .slice(0, MAX_RECIPIENTS_FOR_AI)
+        .map((e, index) => ({
+          index: index + 1,
+          name: e.name,
+          email: e.email,
+        }));
 
       const response = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
@@ -240,29 +475,29 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
             { role: 'system', content: systemPrompt },
             {
               role: 'user',
-              content: `User instructions: ${prompt}\n\nExample recipients:\n${JSON.stringify(
-                limitedClientInfo,
+              content: `User instructions: ${prompt}\n\nSample of recipients (up to ${MAX_RECIPIENTS_FOR_AI}):\n${JSON.stringify(
+                fullRecipientInfo,
                 null,
                 2,
-              )}`,
+              )}\n\nMentioned client names: ${JSON.stringify(clientNames)}`,
             },
           ],
           temperature: 0.7,
         }),
       });
 
+      const data = await response.json().catch(() => ({}));
+
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        console.error('OpenAI error', data);
-        throw new Error(`OpenAI API error: ${response.status}`);
+        console.error('OpenAI campaign error', data);
+        throw new Error(
+          data.error?.message ||
+            `OpenAI API error: ${response.status} ${response.statusText}`,
+        );
       }
 
-      const data = await response.json();
       const content = data.choices?.[0]?.message?.content;
-
-      if (!content) {
-        throw new Error('No content returned from OpenAI');
-      }
+      if (!content) throw new Error('No content returned from OpenAI');
 
       let parsed;
       try {
@@ -275,7 +510,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
 
       setEmailCampaign({
         ...parsed,
-        recipients: emails,
+        recipients: emails, // ALL recipients (not just the sample)
       });
 
       setChatMessages((prev) => [
@@ -283,7 +518,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
         {
           role: 'assistant',
           content:
-            'I generated an email campaign. You can review it in the preview panel.',
+            'I generated an email campaign for the chosen recipients. You can review it in the preview panel.',
         },
       ]);
       setShowEmailPreview(true);
@@ -295,7 +530,8 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
         {
           role: 'assistant',
           content:
-            'I encountered an error while generating the email campaign.',
+            'I encountered an error while generating the email campaign.\n\nDetails: ' +
+            (err.message || ''),
           error: true,
         },
       ]);
@@ -304,20 +540,54 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
     }
   };
 
-  const handleChatSend = async () => {
+  const handleGenerateCampaignClick = async () => {
     if (!chatInput.trim()) return;
-    const msg = chatInput.trim();
+    const prompt = chatInput.trim();
     setChatInput('');
-    await generateEmailCampaign(msg);
+    setChatMessages((prev) => [...prev, { role: 'user', content: prompt }]);
+    await generateEmailCampaign(prompt);
   };
 
-  // Apply search and filters
+  // Open default email app with generated campaign
+  const sendEmails = () => {
+    if (!emailCampaign || !emailCampaign.recipients?.length) {
+      alert('No email campaign or recipients found.');
+      return;
+    }
+
+    try {
+      const toList = emailCampaign.recipients
+        .map((r) => r.email)
+        .filter(Boolean)
+        .join(',');
+
+      if (!toList) {
+        alert('No valid email addresses found.');
+        return;
+      }
+
+      const emailBody = emailCampaign.bodyText || emailCampaign.bodyHtml || '';
+      const subject = encodeURIComponent(emailCampaign.subject);
+      const body = encodeURIComponent(emailBody);
+
+      const mailtoLink = `mailto:${toList}?subject=${subject}&body=${body}`;
+      window.location.href = mailtoLink;
+
+      alert(
+        `Opening email client with ${emailCampaign.recipients.length} recipients...`,
+      );
+    } catch (err) {
+      alert(`Error opening email client: ${err.message}`);
+    }
+  };
+
+  // Apply search & filters
   useEffect(() => {
     let results = [...clients];
 
     if (searchTerm) {
       results = results.filter((client) =>
-        Object.values(client.fields).some((value) =>
+        Object.values(client.fields || {}).some((value) =>
           String(value).toLowerCase().includes(searchTerm.toLowerCase()),
         ),
       );
@@ -326,7 +596,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
     Object.entries(filters).forEach(([field, value]) => {
       if (value) {
         results = results.filter((client) => {
-          const fieldValue = client.fields[field];
+          const fieldValue = (client.fields || {})[field];
           return String(fieldValue || '')
             .toLowerCase()
             .includes(value.toLowerCase());
@@ -351,7 +621,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
     setCurrentPage(1);
   };
 
-  // Pagination helpers
+  // Pagination
   const totalPages = Math.max(
     1,
     Math.ceil(filteredClients.length / clientsPerPage),
@@ -361,11 +631,11 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
   const paginatedClients = filteredClients.slice(startIndex, endIndex);
 
   const goToPage = (page) => {
-    const safe = Math.min(Math.max(page, 1), totalPages);
-    setCurrentPage(safe);
+    const safePage = Math.min(Math.max(page, 1), totalPages);
+    setCurrentPage(safePage);
   };
 
-  // CONFIG SCREEN
+  // --- CONFIG SCREEN ---
   if (showConfig) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
@@ -388,7 +658,9 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
             {error && (
               <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 flex gap-2 items-center">
                 <AlertCircle className="w-4 h-4 text-red-500" />
-                <span className="text-sm text-red-700">{error}</span>
+                <span className="text-sm text-red-700 whitespace-pre-wrap">
+                  {error}
+                </span>
               </div>
             )}
 
@@ -474,7 +746,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
     );
   }
 
-  // MAIN APP
+  // --- MAIN APP ---
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-8">
       <div className="max-w-7xl mx-auto">
@@ -513,7 +785,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
           </div>
         </div>
 
-        {/* Search Bar & Filters */}
+        {/* Search + Filters */}
         <div className="bg-white rounded-2xl shadow-lg p-4 mb-6">
           <div className="flex flex-col md:flex-row gap-3 md:items-center">
             <div className="flex-1 relative">
@@ -547,10 +819,10 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
           </div>
 
           {showFilters && availableFilters.length > 0 && (
-            <div className="mt-4 pt-4 border-t border-gray-100 grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="mt-4 pt-4 border-t border-gray-100 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {availableFilters.map((field) => (
                 <div key={field}>
-                  <label className="block text-xs font-semibold text-gray-500 mb-1">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
                     {field}
                   </label>
                   <input
@@ -559,8 +831,8 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                     onChange={(e) =>
                       handleFilterChange(field, e.target.value)
                     }
-                    placeholder={`Filter by ${field}`}
-                    className="w-full px-3 py-2 border border-gray-200 rounded-md text-sm focus:border-indigo-500 focus:outline-none"
+                    placeholder={`Filter by ${field}...`}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-md focus:border-indigo-500 focus:outline-none text-sm"
                   />
                 </div>
               ))}
@@ -568,59 +840,97 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
           )}
         </div>
 
-        {/* Results Count */}
-        <div className="mb-4 flex items-center justify-between">
-          <span className="text-gray-600">
-            {filteredClients.length > 0 ? (
-              <>
-                Showing {startIndex + 1}–
-                {Math.min(endIndex, filteredClients.length)} of{' '}
-                {filteredClients.length} filtered clients
-                {clients.length !== filteredClients.length &&
-                  ` (total in base: ${clients.length})`}
-              </>
-            ) : (
-              <>Showing 0 of {clients.length} clients</>
-            )}
-          </span>
+        {/* Counts & selection tools */}
+        <div className="mb-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div className="flex flex-col gap-1 text-gray-600 text-sm">
+            <span>
+              {filteredClients.length > 0 ? (
+                <>
+                  Showing {startIndex + 1}–
+                  {Math.min(endIndex, filteredClients.length)} of{' '}
+                  {filteredClients.length} filtered clients
+                  {clients.length !== filteredClients.length &&
+                    ` (total in base: ${clients.length})`}
+                </>
+              ) : (
+                <>Showing 0 of {clients.length} clients</>
+              )}
+            </span>
+            <span className="text-xs text-indigo-700">
+              Selected clients: {selectedClientIds.length}
+            </span>
+          </div>
 
-          {filteredClients.length > 0 && (
+          <div className="flex flex-wrap gap-2 items-center">
             <button
-              onClick={() => {
-                setShowChat(true);
-                setChatMessages([]);
-              }}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition text-sm"
+              onClick={handleSelectAllFiltered}
+              disabled={filteredClients.length === 0}
+              className="px-3 py-2 rounded-lg border border-gray-200 text-xs text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
             >
-              <MessageCircle className="w-4 h-4" />
-              Create Email Campaign
+              Select All Filtered
             </button>
-          )}
-        </div>
 
-        {/* Client Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {paginatedClients.map((client) => (
-            <div
-              key={client.id}
-              onClick={() => setSelectedClient(client)}
-              className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transition cursor-pointer border-2 border-transparent hover:border-indigo-200"
+            <button
+              onClick={handleDeselectAll}
+              disabled={selectedClientIds.length === 0}
+              className="px-3 py-2 rounded-lg border border-gray-200 text-xs text-gray-700 bg-white hover:bg-gray-50 disabled:opacity-50"
             >
-              {Object.entries(client.fields).map(([key, value]) => (
-                <div key={key} className="mb-3">
-                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
-                    {key}
-                  </span>
-                  <p className="text-gray-800 mt-1 break-words">
-                    {Array.isArray(value) ? value.join(', ') : String(value)}
-                  </p>
-                </div>
-              ))}
-            </div>
-          ))}
+              Deselect All
+            </button>
+
+            {filteredClients.length > 0 && (
+              <button
+                onClick={() => setShowChat(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-100 text-indigo-700 rounded-lg hover:bg-indigo-200 transition text-sm font-medium"
+              >
+                <Mail className="w-4 h-4" />
+                Open Campaign Chat
+              </button>
+            )}
+          </div>
         </div>
 
-        {/* Pagination controls */}
+        {/* Client cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {paginatedClients.map((client) => {
+            const isSelected = selectedClientIds.includes(client.id);
+            return (
+              <div
+                key={client.id}
+                onClick={() => setSelectedClient(client)}
+                className={`bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transition cursor-pointer border-2 ${
+                  isSelected ? 'border-indigo-400' : 'border-transparent'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                    Select
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={isSelected}
+                    onChange={() => toggleClientSelection(client.id)}
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-4 h-4 cursor-pointer"
+                  />
+                </div>
+
+                {Object.entries(client.fields || {}).map(([key, value]) => (
+                  <div key={key} className="mb-2">
+                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                      {key}
+                    </span>
+                    <p className="text-gray-800 mt-1 break-words text-sm">
+                      {Array.isArray(value) ? value.join(', ') : String(value)}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Pagination */}
         {filteredClients.length > 0 && (
           <div className="flex items-center justify-center gap-4 mt-6">
             <button
@@ -654,7 +964,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
           </div>
         )}
 
-        {/* Client Detail Modal */}
+        {/* Client detail modal */}
         {selectedClient && (
           <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-40">
             <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-hidden">
@@ -682,21 +992,23 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
 
               <div className="p-6 overflow-y-auto max-h-[60vh]">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {Object.entries(selectedClient.fields).map(([key, value]) => (
-                    <div
-                      key={key}
-                      className="bg-gray-50 rounded-lg p-3 border border-gray-100"
-                    >
-                      <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
-                        {key}
+                  {Object.entries(selectedClient.fields || {}).map(
+                    ([key, value]) => (
+                      <div
+                        key={key}
+                        className="bg-gray-50 rounded-lg p-3 border border-gray-100"
+                      >
+                        <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+                          {key}
+                        </div>
+                        <div className="text-sm text-gray-800 break-words">
+                          {Array.isArray(value)
+                            ? value.join(', ')
+                            : String(value)}
+                        </div>
                       </div>
-                      <div className="text-sm text-gray-800 break-words">
-                        {Array.isArray(value)
-                          ? value.join(', ')
-                          : String(value)}
-                      </div>
-                    </div>
-                  ))}
+                    ),
+                  )}
                 </div>
               </div>
 
@@ -712,15 +1024,14 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
           </div>
         )}
 
-        {/* Email Preview Modal */}
+        {/* Email preview modal */}
         {showEmailPreview && emailCampaign && (
           <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-40">
             <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden">
-              {/* header */}
               <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
                 <div className="flex items-center gap-2">
                   <div className="p-2 bg-indigo-100 rounded-lg">
-                    <MessageCircle className="w-4 h-4 text-indigo-600" />
+                    <Mail className="w-4 h-4 text-indigo-600" />
                   </div>
                   <div>
                     <h2 className="text-sm font-semibold text-gray-900">
@@ -788,7 +1099,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                       Recipients
                     </h3>
                     <span className="text-xs px-2 py-1 rounded-full bg-indigo-100 text-indigo-700">
-                      {emailCampaign.recipients.length} clients
+                      {emailCampaign.recipients.length} recipients
                     </span>
                   </div>
 
@@ -810,8 +1121,7 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                       ))}
                     {emailCampaign.recipients.length > 20 && (
                       <div className="text-xs text-gray-500 text-center pt-2">
-                        +
-                        {emailCampaign.recipients.length - 20} more
+                        +{emailCampaign.recipients.length - 20} more
                         recipients...
                       </div>
                     )}
@@ -821,21 +1131,40 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
 
               <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 flex justify-between items-center">
                 <p className="text-xs text-gray-500">
-                  You can export this content into your email tool. The content
-                  is ready for a mass email campaign.
+                  This campaign will be sent only to clients inferred from your
+                  selection/prompt.
                 </p>
-                <button
-                  onClick={() => setShowEmailPreview(false)}
-                  className="px-4 py-2 text-sm rounded-lg border border-gray-200 text-gray-600 hover:bg-white"
-                >
-                  Close
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={sendEmails}
+                    className="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 flex items-center gap-2"
+                  >
+                    <Mail className="w-4 h-4" />
+                    Send via Email App
+                  </button>
+                  <button
+                    onClick={() => setShowEmailPreview(false)}
+                    className="px-4 py-2 text-xs rounded-lg border border-gray-200 text-gray-600 hover:bg-white"
+                  >
+                    Close
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* Chat Panel */}
+        {/* Floating chat button */}
+        {!showChat && filteredClients.length > 0 && (
+          <button
+            onClick={() => setShowChat(true)}
+            className="fixed bottom-6 right-6 w-12 h-12 rounded-full bg-indigo-600 text-white shadow-xl flex items-center justify-center hover:bg-indigo-700 z-40"
+          >
+            <MessageCircle className="w-6 h-6" />
+          </button>
+        )}
+
+        {/* Chat panel */}
         {showChat && (
           <div className="fixed bottom-4 right-4 w-full max-w-md z-50">
             <div className="bg-white rounded-2xl shadow-2xl overflow-hidden border border-gray-100">
@@ -846,12 +1175,21 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                     Email Campaign Assistant
                   </span>
                 </div>
-                <button
-                  onClick={() => setShowChat(false)}
-                  className="p-1 rounded-full hover:bg-indigo-500"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setChatMessages([])}
+                    className="p-1 rounded-full hover:bg-indigo-500"
+                    title="Clear chat"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => setShowChat(false)}
+                    className="p-1 rounded-full hover:bg-indigo-500"
+                  >
+                    <Minimize2 className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
               <div className="h-72 overflow-y-auto p-4 space-y-3 bg-gray-50">
@@ -860,23 +1198,37 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                     <p className="font-medium text-gray-700 mb-1">
                       How it works
                     </p>
+                    <p className="mb-2">
+                      1) Select clients with checkboxes (optional). <br />
+                      2) Or just mention them by name, like “send an email to
+                      Tina”.
+                    </p>
+                    <p className="mb-2">
+                      <strong>Database access:</strong> for each message, the AI
+                      sees a summary plus{' '}
+                      <strong>up to {MAX_CLIENTS_FOR_AI} clients</strong> from
+                      your current filtered list, with names, emails, company,
+                      and location. If there are more, it only sees the first{' '}
+                      {MAX_CLIENTS_FOR_AI}.
+                    </p>
                     <p>
-                      Describe the email campaign you want to create (for
-                      example: &ldquo;Write an intro email to all data science
-                      professionals, inviting them to a free consultation.&rdquo;)
+                      3) Type a normal question and click the purple button to
+                      chat. <br />
+                      4) Type campaign instructions and use the green button to{' '}
+                      <strong>Generate Campaign</strong>.
                     </p>
                   </div>
                 )}
 
-                {chatMessages.map((msg, i) => (
+                {chatMessages.map((msg, index) => (
                   <div
-                    key={i}
+                    key={index}
                     className={`flex ${
                       msg.role === 'user' ? 'justify-end' : 'justify-start'
                     }`}
                   >
                     <div
-                      className={`max-w-[80%] rounded-2xl px-3 py-2 text-xs shadow-sm ${
+                      className={`max-w-[80%] rounded-2xl px-3 py-2 text-xs shadow-sm whitespace-pre-wrap ${
                         msg.role === 'user'
                           ? 'bg-indigo-600 text-white rounded-br-none'
                           : msg.error
@@ -908,34 +1260,108 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
                     rows={1}
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        handleChatSend();
-                      }
-                    }}
+                    onKeyDown={handleChatKeyPress}
                     className="flex-1 text-xs px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 resize-none"
-                    placeholder="Describe the email campaign you want to create..."
+                    placeholder="Ask a question or describe the campaign you want..."
                   />
                   <button
-                    onClick={handleChatSend}
+                    onClick={sendChatMessage}
                     disabled={chatLoading || !chatInput.trim()}
-                    className="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                    className="p-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                    title="Ask AI"
                   >
-                    {chatLoading ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Send className="w-4 h-4" />
-                    )}
+                    <Send className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={handleGenerateCampaignClick}
+                    disabled={chatLoading || !chatInput.trim()}
+                    className="p-2 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                    title="Generate email campaign for inferred recipients"
+                  >
+                    <Mail className="w-4 h-4" />
                   </button>
                 </div>
               </div>
             </div>
           </div>
         )}
+
+        {/* OpenAI settings modal */}
+        {showOpenAIConfig && (
+          <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-40">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 bg-indigo-100 rounded-lg">
+                    <MessageCircle className="w-4 h-4 text-indigo-600" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-semibold text-gray-900">
+                      OpenAI API Settings
+                    </h2>
+                    <p className="text-xs text-gray-500">
+                      Configure your OpenAI API key to use the AI assistant.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowOpenAIConfig(false)}
+                  className="p-1 rounded-full hover:bg-gray-100"
+                >
+                  <X className="w-4 h-4 text-gray-500" />
+                </button>
+              </div>
+
+              <div className="p-6">
+                {error && (
+                  <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-200 flex gap-2 items-center">
+                    <AlertCircle className="w-4 h-4 text-red-500" />
+                    <span className="text-xs text-red-700 whitespace-pre-wrap">
+                      {error}
+                    </span>
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">
+                      OpenAI API Key
+                    </label>
+                    <input
+                      type="password"
+                      value={openaiKey}
+                      onChange={(e) => setOpenaiKey(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
+                      placeholder="sk-..."
+                    />
+                    <p className="mt-1 text-xs text-gray-400">
+                      Your API key is stored locally in your browser and never
+                      shared with others.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-6 py-3 bg-gray-50 border-t border-gray-100 flex justify-end gap-2">
+                <button
+                  onClick={() => setShowOpenAIConfig(false)}
+                  className="px-4 py-2 text-xs rounded-lg border border-gray-200 text-gray-600 hover:bg-white"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={saveOpenAIConfig}
+                  className="px-4 py-2 text-xs rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+                >
+                  Save API Key
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Loading Overlay */}
+      {/* Loading overlay */}
       {loading && (
         <div className="fixed inset-0 bg-black/20 flex items-center justify-center z-40">
           <div className="bg-white rounded-xl shadow-lg px-4 py-3 flex items-center gap-3">
@@ -949,5 +1375,3 @@ Do NOT include backticks, markdown fences, or anything other than the JSON.`;
     </div>
   );
 }
-
-export default App;
